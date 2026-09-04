@@ -1,5 +1,5 @@
 ---
-title: "Econometrics Assignment 2"
+title: "Australia GDP Forecasting"
 output:
   html_document:
     code_folding: hide
