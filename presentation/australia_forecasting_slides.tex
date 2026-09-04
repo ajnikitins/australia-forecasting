@@ -1,0 +1,431 @@
+\documentclass[aspectratio=169,10pt]{beamer}
+
+\usetheme{Madrid}
+\setbeamertemplate{caption}[numbered]
+\setbeamertemplate{navigation symbols}{}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{xcolor}
+
+\title{Australia GDP Forecasting}
+\author[Class 21, Group 19]{Class 21, Group 19 -- C. Buttignon, D. Mauri, A. J. Nikitins}
+\date{May 2026}
+
+\newcommand{\smallnote}[1]{%
+  \par\vspace{0.05cm}%
+  \noindent
+  \begin{minipage}{0.96\linewidth}
+    \raggedright\scriptsize\itshape #1
+  \end{minipage}%
+}
+
+\newcommand{\fig}[2][]{%
+  \IfFileExists{#2}{\includegraphics[#1]{#2}}{%
+    \fbox{\parbox[c][0.34\textheight][c]{0.9\linewidth}{\centering Missing figure: \texttt{#2}}}%
+  }%
+}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\setlength{\tabcolsep}{4pt}
+\setbeamerfont{caption}{size=\scriptsize}
+
+\begin{document}
+
+% 1
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% 2
+\begin{frame}{Research Question and Data}
+\begin{itemize}
+    \item \textbf{Objective}
+    \begin{itemize}
+        \item Build and compare models for quarterly Australian year-on-year real GDP growth, using recursive one-step-ahead forecasts over 2016Q1--2025Q4.
+    \end{itemize}
+    \item \textbf{Sample}
+    \begin{itemize}
+        \item 1993Q1--2025Q4
+    \end{itemize}
+    \item \textbf{Sources}
+    \begin{itemize}
+        \item Australian Bureau of Statistics and Reserve Bank of Australia.
+    \end{itemize}
+    \item \textbf{Target}
+    \begin{itemize}
+        \item Real GDP growth, year-on-year log change, percent.
+    \end{itemize}
+    \item \textbf{Main predictors}
+    \begin{itemize}
+        \item Inflation, cash rate, change in cash rate, unemployment.
+    \end{itemize}
+\end{itemize}
+\end{frame}
+
+% 3
+\begin{frame}{Descriptive Analysis}
+\begin{columns}
+\begin{column}{0.40\textwidth}
+\begin{itemize}
+    \item Pre-COVID GDP growth is comparatively stable, with moderate cyclical movement around the GFC.
+    \begin{itemize}
+        \item The 2020 contraction and 2021 rebound are the dominant outliers.
+    \end{itemize}
+    \item Inflation and the cash rate shift sharply after 2021.
+    \item Unemployment declines until the early 2000s, then fluctuates around a lower level, with a temporary COVID spike.
+    \item ADF tests reject a unit root for GDP growth, inflation, unemployment, and the cash-rate change.
+    \begin{itemize}
+        \item Thus, we use these variables for our main specifications.
+    \end{itemize}
+\end{itemize}
+\end{column}
+\begin{column}{0.60\textwidth}
+\begin{figure}
+\centering
+\fig[width=\textwidth]{../output/figures/series_plot.png}
+\caption{Australian macroeconomic series}
+\end{figure}
+\end{column}
+\end{columns}
+\end{frame}
+
+% 4
+\begin{frame}{GDP Growth Persistence}
+\begin{columns}
+\begin{column}{0.4\textwidth}
+\begin{itemize}
+    \item GDP growth has strong first-lag persistence.
+    \item The ACF decays gradually, supporting autoregressive dynamics.
+    \item PACF spikes also appear at seasonal lags.
+    \item Since the target is year-on-year growth, lags 4 and 8 are especially important due to base effects.
+    \begin{itemize}
+        \item So, we use model specifications that allow seasonal residual dynamics.
+    \end{itemize}
+\end{itemize}
+\end{column}
+\begin{column}{0.60\textwidth}
+\begin{figure}
+\centering
+\fig[width=\textwidth]{../output/figures/gdp_acf_pacf.png}
+\caption{GDP growth ACF and PACF}
+\end{figure}
+\end{column}
+\end{columns}
+\end{frame}
+
+% 5
+\begin{frame}{Breaks, Outliers, and Controls}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\begin{itemize}
+    \item For stability checks, we use general AR(2), AR(4), ARDL(2,2), and ARDL(4,4) models estimated on 1993Q1--2015Q4.
+    \item Chow tests around 2008Q3--2009Q1 indicate GFC-related instability, especially in richer ARDLs.
+    \begin{itemize}
+        \item However, variance tests suggest that part of the finding is driven by crisis period volatility, not only coefficient instability.
+    \end{itemize}
+    \item Non-benchmark specifications include a post-2008Q4 intercept dummy to account for potential breaks.
+    \begin{itemize}
+        \item Full interactions were excluded for parsimony.
+    \end{itemize}
+    \item Post-dummy CUSUM paths remain inside 5\% bands; Bai-Perron tests do not show strong evidence for another break.
+    \item For the full sample, main residual outliers are located in the COVID period.
+\end{itemize}
+\end{column}
+\begin{column}{0.45\textwidth}
+\begin{figure}
+\centering
+\fig[height=0.7\textheight]{../output/figures/cusum.png}
+\caption{Recursive CUSUM after GFC dummy}
+\end{figure}
+\end{column}
+\end{columns}
+\end{frame}
+
+% 6
+\begin{frame}{Candidate Model Families}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.50\textwidth}
+\begin{itemize}
+    \item \textbf{AR benchmark:} AR(2).
+    \item \textbf{VAR benchmark:} VAR(2) with GDP growth, inflation, and the cash rate.
+    \item \textbf{VAR robustness:} VAR(2) with the cash-rate change.
+    \item \textbf{ARDL:} GDP growth on its own lags plus lagged macro predictors.
+    \item \textbf{ARDL-ARMA:} dynamic regression with ARMA residuals, including lag-4 seasonal terms.
+    \item \textbf{ARMAX:} ARMA model with exogenous macro predictors and seasonal errors.
+\end{itemize}
+\end{column}
+\begin{column}{0.50\textwidth}
+\begin{itemize}
+    \item Why seasonal ARMA errors?
+    \begin{itemize}
+        \item For year-on-year growth, a shock in quarter $t-4$ mechanically affects current growth.
+        \item For example, the COVID collapse in 2020Q2 creates a large 2021Q2 rebound effect.
+        \item Seasonal ARMA errors target this lag-4 dependence.
+    \end{itemize}
+\end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+% 7
+\begin{frame}{Model Selection Strategy}
+\small
+\begin{columns}[onlytextwidth]
+\begin{column}{0.55\textwidth}
+\begin{enumerate}
+    \item Estimate broad ARDL, ARDL-ARMA, and ARMAX model sets.
+    \begin{itemize}
+        \item Permute over variables, lags (up to 4), ARMA components.
+        \item Sample: 1993Q1--2015Q4.
+    \end{itemize}
+    \item Keep top models by BIC and AIC.
+    \item Check residual diagnostics, flag violations.
+    \item Produce recursive one-step forecasts for 2016Q1--2025Q4.
+    \item Rank finalists by MSFE/MAFE and compare with AR(2), VAR(2).
+    \begin{itemize}
+        \item Forecast accuracy is the final criterion because in-sample fit can overfit.
+    \end{itemize}
+\end{enumerate}
+\end{column}
+\begin{column}{0.45\textwidth}
+\centering
+\begin{tabular}{ll}
+\toprule
+Check/Test & Role \\
+\midrule
+BIC & Parsimonious shortlist \\
+AIC & Richer dynamic shortlist \\
+Ljung-Box/BG & Serial correlation \\
+BP/ARCH & Residual heteroskedasticity \\
+Jarque-Bera & Residual normality \\
+Roots/eigenvalues & Dynamic assumptions \\
+\bottomrule
+\end{tabular}
+\end{column}
+\end{columns}
+\end{frame}
+
+% 8
+\begin{frame}{Residual Diagnostics for Finalists}
+% \scriptsize
+\centering
+\resizebox{0.99\textwidth}{!}{%
+\begin{tabular}{llcccc}
+\toprule
+Model & Variables & LB/BG(4) $p$ & LB/BG(8) $p$ & BP/ARCH $p$ & JB $p$ \\
+\midrule
+AR2 & GDP lags 1--2 & 0.001 & 0.001 & 0.028 & 0.360 \\
+VAR2 & GDP, inflation, cash rate lags 1--2 & 0.009 & 0.009 & 0.010 & 0.000 \\
+ARDL5201 & GDP(1), infl.(1) & 0.000 & 0.002 & 0.462 & 0.728 \\
+ARDL\_ARMA5250 & GDP(1), infl.(1), $\Delta$rate(1), unemp.(1); SMA(4) & 0.534 & 0.334 & 0.925 & 0.684 \\
+ARDL\_ARMA5010 & GDP(1), unemp.(1); SMA(4) & 0.623 & 0.483 & 0.929 & 0.633 \\
+ARMAX1450 & AR(1), infl.(1), $\Delta$rate(2), unemp.(1); SMA(4) & 0.207 & 0.147 & 0.884 & 0.894 \\
+\bottomrule
+\end{tabular}%
+}
+\smallnote{Note: Ljung-Box p-values are reported for univariate models; multivariate Breusch-Godfrey p-values are reported for VARs.}
+\vspace{0.18cm}
+% \small
+\begin{itemize}
+    \item AR(2), VAR(2), and plain ARDL models have residual problems, especially autocorrelation.
+    \item ARDL-ARMA and ARMAX models remove the main seasonal residual autocorrelation.
+    \begin{itemize}
+        \item Some seasonal MA roots are close to one: models may not have a structural interpretation, but can still be used for forecasting.
+    \end{itemize}
+\end{itemize}
+\end{frame}
+
+% 9
+\begin{frame}{Economic Hypotheses and Block Tests}
+\centering
+\resizebox{0.99\textwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+Model & GDP persistence & Inflation block & Monetary-policy block & Unemployment block \\
+\midrule
+AR2 & $0.687$ $(p<0.001)$ & -- & -- & -- \\
+VAR2 & $0.514$ $(p<0.001)$ & $-0.213$ $(p<0.001)$ & $0.162$ $(p=0.051)$ & -- \\
+ARDL5201 & $0.427$ $(p<0.001)$ & $-0.235$ $(p=0.009)$ & -- & -- \\
+ARDL\_ARMA5250 & $0.508$ $(p<0.001)$ & $-0.157$ $(p=0.007)$ & $-0.130$ $(p=0.281)$ & $0.082$ $(p<0.001)$ \\
+ARDL\_ARMA5010 & $0.659$ $(p<0.001)$ & -- & -- & $0.091$ $(p<0.001)$ \\
+ARMAX1450 & $0.511$ $(p<0.001)$ & $-0.332$ $(p<0.001)$ & $0.148$ $(p=0.018)$ & $0.150$ $(p<0.001)$ \\
+\bottomrule
+\end{tabular}%
+}
+\smallnote{Note: reported values are sums of lag coefficients; the $p$-values test whether each lag block is jointly zero. For ARMAX, GDP persistence refers to the AR component.}
+
+\vspace{0.14cm}
+\begin{itemize}
+    \item The results should not be interpreted causally.
+    \item GDP persistence is positive and strongly significant in all finalists.
+    \item Inflation is usually negative and statistically relevant.
+    \item Monetary-policy effects are less robust across specifications.
+    \item The positive and significant unemployment coefficient likely captures cyclical mean reversion after periods of weak growth.
+\end{itemize}
+
+\end{frame}
+
+% 10
+\begin{frame}{Recursive Forecast Design}
+\begin{itemize}
+    \item \textbf{Recursive setup}
+    \begin{itemize}
+        \item Evaluation period: 2016Q1--2025Q4.
+        \item Models are re-estimated recursively using an expanding window before each forecast date.
+        \item E.g., the first forecast uses data for 1993Q1--2015Q4.
+    \end{itemize}
+    \item \textbf{Evaluation tools}
+    \begin{itemize}
+        \item MFE for average bias and statistical bias test.
+        \item MSFE, MAFE for forecast loss.
+        \begin{itemize}
+            \item Separately look at the non-COVID period, excluding 2020Q1--2022Q4 from the loss calculation.
+            \item Recursive estimation still uses all historical data available at each forecast date.
+        \end{itemize}
+        \item Forecast-error serial correlation tests for weak efficiency.
+        \item DM and HAC loss-difference tests versus AR(2) and VAR(2).
+    \end{itemize}
+\end{itemize}
+\end{frame}
+
+% 11
+\begin{frame}{Recursive One-Step-Ahead Forecasts}
+\begin{columns}
+\begin{column}{0.33\textwidth}
+\begin{itemize}
+    \item All models miss part of the 2020 collapse and 2021 rebound.
+    \item Benchmarks adjust slowly around COVID.
+    \item Seasonal ARMA-error models track the rebound and later normalization more closely.
+\end{itemize}
+\end{column}
+\begin{column}{0.67\textwidth}
+\begin{figure}
+\centering
+\fig[height=0.64\textheight]{../output/figures/eval_act_frcst_comb.png}
+\caption{Recursive one-step-ahead forecasts by model family}
+\end{figure}
+\end{column}
+\end{columns}
+\end{frame}
+
+% 12
+\begin{frame}{Cumulative Squared Forecast Errors}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.50\textwidth}
+\begin{figure}
+\centering
+\fig[width=0.96\textwidth,height=0.48\textheight,keepaspectratio]{../output/figures/eval_cumse_comb.png}
+\caption{Full evaluation sample}
+\end{figure}
+\end{column}
+\begin{column}{0.50\textwidth}
+\begin{figure}
+\centering
+\fig[width=0.96\textwidth,height=0.48\textheight,keepaspectratio]{../output/figures/eval_cumse_exc_comb.png}
+\caption{Excluding 2020Q1--2022Q4}
+\end{figure}
+\end{column}
+\end{columns}
+\vspace{-0.05cm}
+\begin{itemize}
+    \item Full-sample losses are dominated by COVID-driven base effects.
+    \item Excluding COVID, the ranking is less extreme, but ARDL-ARMA models still compare favorably.
+\end{itemize}
+\end{frame}
+
+% 13
+\begin{frame}{Forecast Quality of Finalists}
+\centering
+\resizebox{0.99\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+Model & MFE & MSFE & MAFE & Bias test $p$ & LB(4) $p$ & LB(8) $p$ \\
+\midrule
+AR2 & -0.253 & 4.136 & 1.158 & 0.299 & 0.033 & 0.024 \\
+VAR2 & 0.007 & 4.234 & 1.170 & 0.984 & 0.208 & 0.046 \\
+ARDL5201 & -0.033 & 3.782 & 1.006 & 0.918 & 0.225 & 0.220 \\
+ARDL\_ARMA5250 & -0.162 & 2.515 & 0.832 & 0.418 & 0.802 & 0.592 \\
+ARDL\_ARMA5010 & -0.138 & 2.302 & 0.755 & 0.456 & 0.771 & 0.507 \\
+ARMAX1450 & -0.256 & 2.480 & 0.858 & 0.250 & 0.923 & 0.650 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{0.15cm}
+\begin{itemize}
+    \item On average, most models tend to overshoot GDP growth, but any bias is statistically insignificant.
+    \item Some evidence that benchmark model errors may be inefficient; accounting for additional variables and seasonal characteristics improves efficiency.
+\end{itemize}
+\end{frame}
+
+% 14
+\begin{frame}{Forecast Accuracy of Finalists}
+\centering
+\resizebox{0.99\textwidth}{!}{%
+\begin{tabular}{lccccccccc}
+\toprule
+Model & MSFE & MSFE/AR2 & MSFE/VAR2 & MSFE/AR2 ex.\@ COVID & DM vs AR2 $p$ & HAC loss vs AR2 $p$ & DM vs VAR2 $p$ & HAC vs VAR2 $p$ \\
+\midrule
+AR2 & 4.136 & 1.000 & 0.977 & 1.000 & -- & -- & 0.436 & 0.417 \\
+VAR2 & 4.234 & 1.024 & 1.000 & 0.985 & 0.564 & 0.583 & -- & -- \\
+ARDL5201 & 3.782 & 0.914 & 0.893 & 0.652 & 0.249 & 0.163 & 0.132 & 0.189 \\
+ARDL\_ARMA5250 & 2.515 & 0.608 & 0.594 & 0.522 & 0.118 & 0.124 & 0.133 & 0.128 \\
+ARDL\_ARMA5010 & 2.302 & 0.557 & 0.544 & 0.394 & 0.089 & 0.098 & 0.104 & 0.100 \\
+ARMAX1450 & 2.480 & 0.599 & 0.586 & 0.696 & 0.106 & 0.112 & 0.121 & 0.111 \\
+\bottomrule
+\end{tabular}%
+}
+\smallnote{Note: DM / HAC loss p-values are one-sided.}
+\vspace{0.15cm}
+\begin{itemize}
+    \item \textbf{Best forecast model:} ARDL\_ARMA5010; MSFE is 44.3\% below AR(2).
+    \begin{itemize}
+        \item ARDL\_ARMA5010: GDP growth and unemployment lags with seasonal MA(4) error dynamics.
+        \item DM/HAC evidence is marginal, so the improvement is economically meaningful but statistically tentative.
+        \begin{itemize}
+            \item DM/HAC p-values are anyway treated as indicative because some comparisons are close to nested and the evaluation sample is short.
+        \end{itemize}
+    \end{itemize}
+    \item \textbf{Richer economic alternative:} ARDL\_ARMA5250; includes GDP, inflation, monetary policy, unemployment, and seasonal MA errors.
+    \item \textbf{Best ARMAX}: ARMAX1450: similar accuracy with ARMAX structure.
+\end{itemize}
+\end{frame}
+
+% 15
+\begin{frame}{Conclusion, Caveats, and LLM Use}
+\textbf{Main conclusion}
+\begin{itemize}
+    \item Models that allow seasonal ARMA residual dynamics outperform the AR(2) and VAR(2) benchmarks in MSFE terms.
+    \item The differences are largest during COVID but remain visible in the non-COVID evaluation.
+\end{itemize}
+
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.50\textwidth}
+\textbf{Economic interpretations}
+\begin{itemize}
+    \item GDP growth is persistent.
+    \item Inflation and unemployment add predictive content.
+    \item Cash-rate effects are less stable.
+    \item Seasonal base effects are central for year-on-year GDP growth.
+\end{itemize}
+\end{column}
+\begin{column}{0.50\textwidth}
+\textbf{Caveats}
+\begin{itemize}
+    \item Only 40 forecast observations.
+    \item COVID dominates full-sample loss.
+    \item Some MA roots are near the unit boundary.
+    \item Forecast gains are not strongly significant at conventional levels.
+\end{itemize}
+\end{column}
+\end{columns}
+
+\vfill
+\scriptsize\textbf{LLM usage disclosure:} Codex was used for the initial code scaffold, but the code was later rewritten. ChatGPT was used for conceptual exploration, clearing up implementation questions, and sanity-checking the results. Final modelling choices, code execution, and reported results were checked by ourselves.
+\end{frame}
+
+\end{document}

@@ -1,0 +1,1742 @@
+---
+title: "Econometrics Assignment 2"
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+# Load packages
+library(knitr)
+library(zoo)
+library(forecast)
+library(vars)
+library(lmtest)
+library(sandwich)
+library(tseries)
+library(broom)
+library(modelsummary)
+library(readxl)
+library(janitor)
+library(scales)
+library(glue)
+library(fixest)
+library(strucchange)
+library(car)
+library(multidplyr)
+library(gridExtra)
+library(marginaleffects)
+library(tidyverse)
+
+theme_set(theme_minimal(base_size = 12))
+
+# Ensure directories
+dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/models", recursive = TRUE, showWarnings = FALSE)
+
+# Paths
+raw_path <- "data/data_raw.xlsx"
+path_models <- "output/models/estimation.rds"
+path_forecasts <- "output/models/forecasts.rds"
+
+# Variables
+sample_start <- "1993 Q1"
+sample_end <- "2025 Q4"
+evaluation_start <- "2016 Q1"
+evaluation_end <- "2025 Q4"
+
+extra_predictor <- c("unemp")
+regressors <- c("gdp_yoy", "infl_yoy", "d_rate", extra_predictor)
+
+mod_max_lags <- 4
+
+hac_vcov <- function(fit, lag = 4) {
+  NeweyWest(fit, lag = lag, prewhite = FALSE, adjust = TRUE)
+}
+
+# Flags
+include_nowcasts <- FALSE
+
+generate_models <- FALSE
+generate_forecasts <- FALSE
+```
+
+# Build Dataset
+
+```{r build_dataset}
+# Raw data
+clean_raw_data <- \(data) {
+  res <- data %>%
+    clean_names() %>%
+    mutate(
+      date = as.Date(date),
+      quarter = as.yearqtr(date)
+    )
+
+  res
+}
+
+raw_data_quarterly <- read_xlsx(raw_path, sheet = "Q") %>%
+  clean_raw_data() %>%
+  select(quarter, rgdp, cpi)
+
+raw_data_monthly <- read_xlsx(raw_path, sheet = "M") %>%
+  clean_raw_data() %>%
+  group_by(quarter) %>%
+  summarise(unemp = mean(unemp), .groups = "drop")
+
+raw_data_daily <- read_xlsx(raw_path, sheet = "D") %>%
+  clean_raw_data() %>%
+  group_by(quarter) %>%
+  summarise(cash = mean(cash), .groups = "drop")
+
+raw_inputs <- reduce(
+  list(raw_data_quarterly, raw_data_monthly, raw_data_daily),
+  ~ left_join(.x, .y, by = "quarter")
+)
+
+# Formatted data
+dataset <- raw_inputs %>%
+  arrange(quarter) %>%
+  mutate(date = as.Date(quarter), .before = 1) %>%
+  # Growth rates
+  mutate(
+    gdp_yoy = 100 * (log(rgdp) - log(lag(rgdp, 4))),
+    infl_yoy = 100 * (log(cpi) - log(lag(cpi, 4))),
+    rate = cash,
+    d_rate = rate - lag(rate),
+    d_unemp = unemp - lag(unemp),
+  ) %>%
+  # Filter sample
+  filter(
+    quarter >= sample_start,
+    quarter <= sample_end
+  ) %>%
+  # drop_na(rgdp, cpi, cash, unemp, gdp_yoy, infl_yoy, rate) %>%
+  mutate(t = 1:n()) %>%
+  select(
+    date,
+    t,
+    quarter,
+    rgdp,
+    cpi,
+    cash,
+    unemp,
+    d_unemp,
+    gdp_yoy,
+    infl_yoy,
+    rate,
+    d_rate
+  )
+
+# Error if NAs in the data
+invisible(na.fail(dataset))
+
+kable(head(dataset, 8), digits = 3, caption = "Processed estimation dataset preview")
+
+## Create lagged and filtered model dataset
+model_dataset <- dataset %>%
+  arrange(t) %>%
+  reduce(seq(0, mod_max_lags), .init = ., \(data, lag) {
+    res <- data %>%
+      mutate(across(all_of(regressors), ~ lag(., lag), .names = "{.col}_l{lag}"))
+
+    res
+  }) %>%
+    filter(t > mod_max_lags)
+
+selection_dataset <- filter(model_dataset, quarter < evaluation_start)
+```
+
+# Descriptive Analysis
+
+```{r summary_statistics}
+analysis_variable_dictionary <- tribble(
+    ~variable, ~label,
+    "gdp_yoy", "GDP growth (YoY, %)",
+    "infl_yoy", "Inflation (YoY, %)",
+    "rate", "Cash rate (%)",
+    "d_rate", "Change in cash rate (pp)",
+    "unemp", "Unemployment rate (%)"
+  )
+
+# Summary statistics
+summary_vars <- c("gdp_yoy", "infl_yoy", "rate", "d_rate", "unemp")
+
+summary_stats <- dataset %>%
+  select(all_of(summary_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n = n(),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    p25 = quantile(value, 0.25, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    p75 = quantile(value, 0.75, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(analysis_variable_dictionary, ., by = "variable")
+
+kable(
+  summary_stats,
+  digits = 3,
+  caption = "Summary statistics"
+)
+```
+
+```{r series_plot, fig.width=10, fig.height=10}
+# Series plot
+plot_data <- dataset %>%
+  select(date, all_of(summary_vars)) %>%
+  pivot_longer(-date, names_to = "variable", values_to = "value") %>%
+  left_join(analysis_variable_dictionary, by = "variable")
+
+series_plot <- ggplot(plot_data, aes(x = date, y = value)) +
+  geom_line(color = "#0b5d8c", linewidth = 0.6) +
+  facet_wrap(~ label, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Australia macroeconomic series",
+    x = NULL, y = NULL
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+series_plot
+
+# ggsave("output/figures/series_plot.png", series_plot, width = 10, height = 10, dpi = 300)
+{series_plot + labs(title = NULL) } %>%
+ggsave("output/figures/series_plot.png", ., width = 5, height = 3.5, dpi = 300)
+```
+
+
+```{r stationarity}
+run_adf_urca <- \(x, variable, type = "drift", max_lags = 4) {
+  x <- na.omit(x)
+
+  test <- ur.df(
+    x,
+    type = type,          # "none", "drift", or "trend"
+    lags = max_lags,
+    selectlags = "AIC"
+  )
+
+  tau_name <- switch(
+    type,
+    "none" = "tau1",
+    "drift" = "tau2",
+    "trend" = "tau3"
+  )
+
+  stat <- test@teststat[1, tau_name]
+  crit_5 <- test@cval[tau_name, "5pct"]
+  crit_10 <- test@cval[tau_name, "10pct"]
+
+  tibble(
+    variable = variable,
+    adf_type = type,
+    adf_stat = stat,
+    adf_crit_5pct = crit_5,
+    adf_reject_unit_root_5pct = stat < crit_5,
+    adf_crit_10pct = crit_10,
+    adf_reject_unit_root_10pct = stat < crit_10
+  )
+}
+
+adf_table <- map_dfr(summary_vars, ~ run_adf_urca(dataset[[.]], ., type = "drift"))
+
+kable(
+  adf_table,
+  digits = 3,
+  caption = "Augmented Dickey-Fuller results"
+)
+```
+
+```{r acf_pacf_plot, fig.width=8, fig.height=8}
+# ACF/PACF plot
+get_acf_pacf_plot <- \(var, max_lag = 12, title = NULL) {
+  acf_df <- var %>%
+    acf(lag.max = max_lag, plot = FALSE) %>%
+    tidy() %>%
+    rename(ACF = acf)
+
+  pacf_df <- var %>%
+    pacf(lag.max = max_lag, plot = FALSE) %>%
+    tidy() %>%
+    rename(PACF = acf)
+
+  acf_pacf_plot <- full_join(acf_df, pacf_df, by = "lag") %>%
+    filter(lag > 0) %>%
+    mutate(ci = qnorm((1 + 0.95)/2)/sqrt(length(var))) %>%
+    pivot_longer(c(ACF, PACF), names_to = "type", values_to = "value") %>%
+    ggplot(aes(x = lag, y = value)) +
+    geom_hline(yintercept = 0, color = "grey50") +
+    geom_segment(aes(xend = lag, yend = 0), color = "#c45508", linewidth = 0.7) +
+    geom_hline(aes(yintercept = ci), linetype = "dashed") +
+    geom_hline(aes(yintercept = -ci), linetype = "dashed") +
+    facet_wrap(~ type, ncol = 1) +
+    scale_x_continuous(breaks = pretty_breaks()) +
+    labs(
+      title = title,
+      x = "Lag (quarters)",
+      y = NULL
+    )
+}
+
+acf_pacf_plot <- get_acf_pacf_plot(dataset$gdp_yoy, title = "GDP growth autocorrelation diagnostics")
+
+acf_pacf_plot
+
+# ggsave("output/figures/gdp_acf_pacf.png", acf_pacf_plot, width = 8, height = 8, dpi = 300)
+{ acf_pacf_plot + labs(title = NULL)} %>%
+ggsave("output/figures/gdp_acf_pacf.png", ., width = 6, height = 4.2, dpi = 300)
+```
+
+## Comment
+
+### Variables
+
+For the purposes of forecasting quarterly Y-o-Y GDP growth, the dataset is transformed
+into quarterly variables. Real GDP and CPI are converted into year-on-year log
+growth rates, while the cash rate is used mainly in first differences because
+the level appears nonstationary. Unemployment is retained as the extra predictor.
+
+For the training sample, we select 1993Q1–2015Q4.
+For the evaluation sample, we use 2016Q1–2025Q4.
+
+### Descriptive analysis
+
+Australian GDP growth is fairly stable before COVID, but the 2020 collapse and 2021
+rebound create extreme observations that dominate the later forecast evaluation.
+Inflation and interest rates also shift sharply after 2021, so model stability and
+out-of-sample performance are especially important.
+
+### Stationarity and autocorrelation
+
+The ADF tests support using GDP growth, inflation, unemployment and the change in
+the cash rate as stationary variables. The ACF/PACF of GDP growth shows persistence,
+especially at the first lag, which justifies dynamic specifications such as AR,
+ARDL and VAR models.
+
+## Breakpoint checking
+
+```{r breakpoints}
+get_test_models <- \(dataset, intercept = NULL, interaction = NULL) {
+  if (!is.null(intercept)) {
+    list(
+      ar2 = glue("gdp_yoy ~ gdp_yoy_l1 + gdp_yoy_l2 + {intercept}"),
+      ar4 = glue("gdp_yoy ~ gdp_yoy_l1 + gdp_yoy_l2 + gdp_yoy_l3 + gdp_yoy_l4 + {intercept}"),
+      ardl2 = glue("gdp_yoy ~ {paste(c(unlist(map(regressors, ~ glue('{.}_l{seq(1, 2)}')))), collapse = '+')} + {intercept}"),
+      ardl4 = glue("gdp_yoy ~ {paste(c(unlist(map(regressors, ~ glue('{.}_l{seq(1, 4)}')))), collapse = '+')} + {intercept}")
+    ) %>%
+      map(~ lm(formula(.), data = dataset))
+  } else  if (!is.null(interaction)) {
+    list(
+      ar2 = glue("gdp_yoy ~ (gdp_yoy_l1 + gdp_yoy_l2) * {interaction}"),
+      ar4 = glue("gdp_yoy ~ (gdp_yoy_l1 + gdp_yoy_l2 + gdp_yoy_l3 + gdp_yoy_l4) * {interaction}"),
+      ardl2 = glue("gdp_yoy ~ ({paste(c(unlist(map(regressors, ~ glue('{.}_l{seq(1, 2)}')))), collapse = '+')}) * {interaction}"),
+      ardl4 = glue("gdp_yoy ~ ({paste(c(unlist(map(regressors, ~ glue('{.}_l{seq(1, 4)}')))), collapse = '+')}) * {interaction}")
+    ) %>%
+      map(~ lm(formula(.), data = dataset))
+  } else {
+    list(
+      ar2 = gdp_yoy ~ gdp_yoy_l1 + gdp_yoy_l2,
+      ar4 = gdp_yoy ~ gdp_yoy_l1 + gdp_yoy_l2 + gdp_yoy_l3 + gdp_yoy_l4,
+      ardl2 = reformulate(unlist(map(regressors, ~ glue("{.}_l{seq(1, 2)}"))), response = "gdp_yoy"),
+      ardl4 = reformulate(unlist(map(regressors, ~ glue("{.}_l{seq(1, 4)}"))), response = "gdp_yoy")
+    ) %>%
+      map(~ lm(., data = dataset))
+  }
+}
+
+# Pulse dummies
+mod_resid <- list(
+  ar2 = lm(gdp_yoy ~ gdp_yoy_l1 + gdp_yoy_l2, data = model_dataset),
+  ar4 = lm(gdp_yoy ~ gdp_yoy_l1 + gdp_yoy_l2 + gdp_yoy_l3 + gdp_yoy_l4 , data = model_dataset),
+  ardl2 = lm(reformulate(unlist(map(regressors, ~ glue("{.}_l{seq(1, 2)}"))), response = "gdp_yoy"), data = model_dataset),
+  ardl4 = lm(reformulate(unlist(map(regressors, ~ glue("{.}_l{seq(1, 4)}"))), response = "gdp_yoy"), data = model_dataset)
+)
+
+## Check residuals (largest are 106, 110)
+plot_residuals <- map_dfc(mod_resid, ~ rstandard(.)) %>%
+  mutate(date = model_dataset$date) %>%
+  pivot_longer(-date, names_to = "model", values_to = "res") %>%
+  ggplot(aes(x = date, y = res)) +
+  geom_line() +
+  geom_hline(yintercept = c(-3, 3), color = "red") +
+  geom_hline(yintercept = c(-2, 2), color = "red", linetype = "dashed") +
+  facet_wrap(~ model) +
+  labs(title = "Standardized residuals", x = NULL, y = NULL)
+
+ggsave("output/figures/residuals.png", plot_residuals, width = 10, height = 10, dpi = 300)
+
+# Breakpoints
+breakpoint_dataset <- selection_dataset
+
+mod_brkp <- get_test_models(breakpoint_dataset)
+
+## Chow
+shock_candidates <- tribble(
+  ~name, ~start, ~comment,
+  "gfc_2008q3", "2008 Q3", "GFC",
+  "gfc_2008q4", "2008 Q4", "GFC",
+  "gfc_2009q1", "2009 Q1", "GFC"
+)
+
+chow_test <- \(mod, t) {
+  tryCatch(sctest(formula(mod), data = breakpoint_dataset, type = "Chow", point = t)$p.value, error = \(e) NA)
+}
+
+variance_break_test <- function(fit, break_idx) {
+  e <- resid(fit)
+  model_data <- model.frame(fit)
+
+  idxs <- index(breakpoint_dataset$quarter)
+
+  pre  <- e[idxs <=  break_idx]
+  post <- e[idxs > break_idx]
+
+  test <- var.test(post, pre)
+
+  data.frame(
+    var_pre = var(pre),
+    var_post = var(post),
+    F_stat = unname(test$statistic),
+    p_value = test$p.value
+  )
+}
+
+diag_chow <- shock_candidates %>%
+  mutate(break_idx = match(start, breakpoint_dataset$quarter) - 1) %>%
+  rowwise() %>%
+  mutate(bind_cols(set_names(map(mod_brkp, ~ variance_break_test(., break_idx[[1]])$p_value), paste0("var_p_", names(mod_brkp))))) %>%
+  mutate(bind_cols(set_names(map(mod_brkp, ~ chow_test(., break_idx[[1]])), paste0("chow_p_", names(mod_brkp)))))
+
+kable(
+  diag_chow,
+  digits = 3,
+  caption = "Chow tests for candidate breakpoints"
+)
+
+# GFC test
+breakpoint_dataset <- breakpoint_dataset %>%
+  mutate(
+    post_gfc_2008q4 = as.integer(quarter >= "2008 Q4")
+  )
+
+mod_brkp_gfc <- get_test_models(breakpoint_dataset, intercept = "post_gfc_2008q4")
+
+diagn_gfc <- map2_dfr(mod_brkp_gfc, names(mod_brkp_gfc), \(model, name) {
+  # print(coeftest(model, vcov = hac_vcov(model)))
+
+  test_int <- linearHypothesis(
+    model,
+    "post_gfc_2008q4",
+    vcov. = hac_vcov(model),
+    test = "Chisq"
+  )
+
+  tibble(model = name, int_p = test_int[2, 4])
+})
+
+mod_brkp_gfc_int <- get_test_models(breakpoint_dataset, interaction = "post_gfc_2008q4")
+
+diagn_gfc_int <- map2_dfr(mod_brkp_gfc_int, names(mod_brkp_gfc_int), \(model, name) {
+  # print(summary(model, vcov. = hac_vcov(model)))
+
+  test_slop <- linearHypothesis(
+    model,
+    grep(":post_gfc_2008q4", names(coef(model)), value = TRUE),
+    vcov. = hac_vcov(model),
+    test = "Chisq"
+  )
+
+  tibble(
+    model = name,
+    slop_p = test_slop[2, 4],
+  )
+})
+
+left_join(diagn_gfc, diagn_gfc_int, by = "model") %>%
+  kable(
+    digits = 3,
+    caption = "Tests for GFC breakpoint intercept & slopes"
+  )
+
+## Recursive/CUSUM instability tests
+diag_cusum <- map2_dfr(mod_brkp_gfc, names(mod_brkp_gfc), \(model, name) {
+  cusum <- efp(formula(model), data = breakpoint_dataset, type = "Rec-CUSUM")
+  test <- sctest(cusum)
+  # print(test)
+
+  tibble(
+    model = name,
+    cusum_p = test$p.value,
+    series = list(
+      tibble(
+        process = c(rep(NA, cusum$nreg-1), cusum$process),
+        boundary = c(rep(NA, cusum$nreg-1), strucchange::boundary(cusum, alpha = 0.05, alt.boundary = FALSE, functional = "max"))
+      )
+    )
+  )
+})
+
+plot_cusum <- diag_cusum %>%
+  unnest(series) %>%
+  mutate(
+    date = rep(breakpoint_dataset$date, length(mod_brkp_gfc)),
+  ) %>%
+  ggplot(aes(x = date, y = process)) +
+  geom_line() +
+  geom_line(aes(y = -boundary)) +
+  geom_line(aes(y = boundary)) +
+  geom_hline(aes(yintercept = 0)) +
+  facet_wrap(~ model) +
+  labs(title = "Recursive CUSUM test", x = NULL, y = NULL)
+
+# ggsave("output/figures/cusum.png", plot_cusum, width = 10, height = 10, dpi = 300)
+{ plot_cusum + labs(title = NULL) } %>%
+ggsave("output/figures/cusum.png", ., width = 3.5, height = 3.5, dpi = 300)
+
+# ## Bai-Perron (unknown dates)
+walk2(mod_brkp_gfc, names(mod_brkp_gfc), \(model, name) {
+  bp <- breakpoints(formula(model), data = breakpoint_dataset, h = 0.25)
+
+  print(summary(bp))
+  if (all(is.na(bp$breakpoints))) {
+    print("No breakpoints detected")
+  } else {
+    print(breakpoint_dataset$quarter[bp$breakpoints])
+  }
+})
+```
+
+```{r breakpoint_plots, fig.width = 10, fig.height = 10}
+plot_residuals
+plot_cusum
+```
+
+### Comment
+
+We use AR2, AR4, ARDL2, ARDL4 as general benchmarks for checking data/parameter stability.
+
+We test for parameter instability using Chow tests at pre-specified GFC dates and
+recursive CUSUM tests. The Chow tests indicate GFC-related instability around 2008Q3–2009Q1,
+although variance tests suggest that this partly reflects a crisis-period volatility
+shift rather than a clean coefficient break. Directly testing parameter instability
+with a 2008Q4 GFC shift dummy indicates a statistically significant change in average
+post-GFC output dynamics, while variable dynamics also changed for the ARDL models.
+To preserve parsimonity in the main specifications, we include only the GFC shift dummy.
+After its inclusion, the CUSUM paths remain within the 5% bands, providing no
+strong evidence of remaining cumulative instability. Bai-Perron tests do not indicate
+another unknown breakpoint.
+
+The GFC period shows some evidence of instability, especially through changes in
+residual variance and the intercept. A post-2008Q4 dummy is therefore included in
+the main models to capture a persistent shift without overcomplicating the specification
+with interaction terms.
+
+```{r add_breakpoints}
+model_dataset <- model_dataset %>%
+  mutate(
+    post_gfc_2008q4 = as.integer(quarter >= "2008 Q4"),
+  )
+
+selection_dataset <- filter(model_dataset, quarter < evaluation_start)
+```
+
+# Model estimation
+
+## Estimation
+
+### Comment
+
+Specifications:
+
+Benchmarks: AR2, VAR2 (gdp_yoy, infl_yoy, rate), VAR2 (gdp_yoy, infl_yoy, d_rate);
+
+ARDL: iterating all variables & lags; easy to interpret
+
+ARDL with seasonal ARMA errors (ARDL_ARMA): iterates over seasonal ARMA error specifications.
+
+Later will see that basic ARDL errors have 4/8 quarter autocorrelation. This is
+because we are modelling quarterly Y-o-Y growth, i.e., every quarter the current
+GDP is compared to the GDP a year ago. This causes a "base effect", exemplified
+by Covid: on 2020Q2 GDP dropped, resulting in a negative growth rate. Then, over
+2020, GDP recovered, so in 2021Q2, the rebounded level of GDP is compared to the
+2020Q2's low, causing a spike in the growth rate. This is also repeated for the
+drop in 2021Q3 and spike in 2022Q3. Including lag-4 seasonal (AR)MA errors accounts
+for this.
+
+(S)ARMAX: same motivation as ARDL_ARMA, but the autoregressive component is specified
+in the error term.
+
+
+```{r estimate_models}
+# Generate model zoo specifications
+common_controls <- "post_gfc_2008q4"
+
+model_specs_grid <- expand_grid(
+  !!!setNames(
+    rep(list(seq(-1, mod_max_lags)), length(regressors)),
+    regressors
+  ),
+  ar = seq(0, mod_max_lags), ma = c(0, 1), s_ar = c(0, 1), s_ma = c(0,1)
+) %>%
+  filter(gdp_yoy != 0) %>%
+  filter(!(ar != 0 & gdp_yoy != -1)) %>%
+  filter(include_nowcasts | if_all(all_of(regressors), ~ . != 0)) %>%
+  mutate(model = as.character(row_number()))
+
+model_specs_ardl <- model_specs_grid %>%
+  filter(if_all(c(ar, ma, s_ar, s_ma), ~ . == 0)) %>%
+  rowwise() %>%
+  mutate(regressors = list(reduce2(c_across(all_of(regressors)), regressors, \(acc, lag, var) {
+    if (lag != -1) {
+        min_lag <- 1 - as.numeric(include_nowcasts)
+        c(acc, glue("{var}_l{seq(min_lag, lag)}"))
+    } else acc
+  }, .init = character(0)))) %>%
+  mutate(family = "zoo", type = "ARDL") %>%
+  mutate(controls = list(common_controls)) %>%
+  mutate(model = paste0("ARDL", model))
+
+model_specs_arma <- model_specs_grid %>%
+  filter(if_any(c(ar, ma, s_ar, s_ma), ~ . != 0)) %>%
+  rowwise() %>%
+  mutate(regressors = list(reduce2(c_across(all_of(regressors)), regressors, \(acc, lag, var) {
+    if (lag != -1) {
+        min_lag <- 1 - as.numeric(include_nowcasts)
+        c(acc, glue("{var}_l{seq(min_lag, lag)}"))
+    } else acc
+  }, .init = character(0)))) %>%
+  mutate(family = "zoo", type = if_else(gdp_yoy == -1, "ARMAX", "ARDL_ARMA")) %>%
+  mutate(controls = list(common_controls)) %>%
+  mutate(model = paste0(if_else(gdp_yoy == -1, "ARMAX", "ARDL_ARMA"), model))
+
+model_specs <- tribble(
+  ~ model, ~ family, ~ type, ~ regressors, ~ controls, ~ gdp_yoy, ~ infl_yoy, ~ rate, ~ d_rate,
+  "AR2", "benchmark", "ARDL",  c("gdp_yoy_l1", "gdp_yoy_l2"), character(0), 2, -1, -1, -1,
+  "VAR2", "benchmark", "VAR", c("gdp_yoy", "infl_yoy", "rate"), character(0), 2, 2, 2, -1,
+  "VAR2d", "benchmark", "VAR", c("gdp_yoy", "infl_yoy", "d_rate"), character(0), 2, 2, -1, 2
+) %>%
+  bind_rows(model_specs_ardl) %>%
+  bind_rows(model_specs_arma) %>%
+  mutate(
+    across(-c(model, family, type, regressors, controls, ar, ma, s_ar, s_ma), ~ replace_na(., -1)),
+    across(c(ar, ma, s_ar, s_ma), ~ replace_na(., 0))
+  )
+
+# Model estimation
+## ARDL
+fit_lm_model <- function(spec, data) {
+  all_regressors <- c(spec$regressors[[1]], spec$controls[[1]])
+
+  model_formula <- reformulate(all_regressors, response = "gdp_yoy")
+
+  fit <- lm(model_formula, data = data)
+
+  tibble(
+    fit = list(fit)
+  )
+}
+
+## VAR
+fit_var_model <- function(spec, data, lag_order = 2L) {
+  fit_data <- bind_rows(
+    dataset[seq(mod_max_lags - lag_order + 1, mod_max_lags),],
+    data
+  )
+
+  endogenous <- spec$regressors[[1]]
+  controls <- spec$controls[[1]]
+
+  if (length(controls) > 0) {
+    fit <- VAR(
+      y = fit_data[, endogenous],
+      p = lag_order,
+      type = "const",
+      exogen = fit_data[, controls]
+    )
+  } else {
+    fit <- VAR(
+      y = fit_data[, endogenous],
+      p = lag_order,
+      type = "const"
+    )
+  }
+
+  tibble(fit = list(fit))
+}
+
+## ARMA
+fit_arma_model <- function(spec, data) {
+  all_regressors <- c(spec$regressors[[1]], spec$controls[[1]])
+
+  max_lag <- max(spec$ar, spec$ma, spec$s_ma, spec$s_ar)
+
+  y <- data$gdp_yoy
+
+  fit <- tryCatch({
+    if (length(all_regressors) > 0) {
+      Arima(
+        y, xreg = as.matrix(data[, all_regressors]),
+        order = c(spec$ar, 0, spec$ma),
+        seasonal = list(order = c(spec$s_ar, 0, spec$s_ma), period = 4),
+        method = "ML"
+      )
+    } else {
+      Arima(
+        y,
+        order = c(spec$ar, 0, spec$ma),
+        seasonal = list(order = c(spec$s_ar, 0, spec$s_ma), period = 4),
+        method = "ML"
+      )
+    }
+  }, error = \(e) {
+    message(paste("Error for model", spec$model[[1]]))
+    stop(e)
+  })
+
+  tibble(fit = list(fit))
+}
+
+## Iterate over all specs
+if (generate_models | !file.exists(path_models)) {
+  cl <- new_cluster(parallel::detectCores()-1)
+  cluster_copy(cl, c(
+    "fit_lm_model", "fit_var_model", "fit_arma_model",
+    "selection_dataset", "dataset", "mod_max_lags"
+  ))
+  cluster_library(cl, c("dplyr", "forecast", "vars"))
+
+  model_results <- model_specs %>%
+    rowwise() %>%
+    partition(cl) %>%
+    mutate(switch(type,
+      "ARDL" = fit_lm_model(cur_data(), selection_dataset),
+      "VAR" = fit_var_model(cur_data(), selection_dataset),
+      "ARMAX" = fit_arma_model(cur_data(), selection_dataset),
+      "ARDL_ARMA" = fit_arma_model(cur_data(), selection_dataset)
+    )) %>%
+    collect() %>%
+    ungroup()
+
+  rm(cl)
+
+  saveRDS(model_results, path_models)
+} else {
+  model_results <- readRDS(path_models)
+}
+```
+
+## Shortlisting
+
+```{r shortlisting}
+# Model selection
+
+## ICs
+model_diagn_ic <- model_results %>%
+  rowwise() %>%
+  mutate(across(fit, list(bic = BIC, aic = AIC))) %>%
+  ungroup()
+
+model_diagn_ic %>%
+  filter(family == "zoo") %>%
+  mutate(group = if_else(type %in% c("ARDL", "ARDL_ARMA"), gdp_yoy, ar)) %>%
+  ggplot(aes(x = fit_bic, y = fit_aic, color = group)) + geom_point() + facet_wrap(~ type)
+
+### Can see that models without gdp_yoy are dominated
+
+model_shortlist <- model_diagn_ic %>%
+  filter(family == "benchmark") %>%
+  mutate(selection = "benchmark") %>%
+  bind_rows(
+    bind_rows(
+      model_diagn_ic %>%
+        slice_min(fit_bic, n = 5, with_ties = FALSE, by = type) %>%
+        mutate(selection = "Best BIC"),
+      model_diagn_ic %>%
+        slice_min(fit_aic, n = 5, with_ties = FALSE, by = type) %>%
+        mutate(selection = "Best AIC")
+    ) %>% arrange(type, selection)
+  ) %>%
+  distinct(pick(-selection), .keep_all = TRUE)
+
+model_shortlist %>%
+  select(-c(type, regressors, controls, fit)) %>%
+  kable()
+```
+
+### Comment
+
+We shortlist models with BIC & AIC, top 5 for each type for IC, so that model choice is
+not driven by one criterion.
+Models without an autoregressive component are dominated, and both BIC&AIC prefer
+models with at least seasonal MA errors.
+BIC tends to select simpler models with fewer variables and lags, while AIC favours
+larger models with more lags or ARMA errors.
+Note: VAR ICs cannot be compared with non-VAR models as they are for the whole model,
+not just the GDP part.
+
+## Diagnostics
+
+```{r diagnostics}
+# Diagnostics
+
+## ARDL
+ar_root_check <- function(fit, prefix = "gdp_yoy_l") {
+  b <- coef(fit)
+
+  phi <- b[str_detect(names(b), paste0("^", prefix))]
+  phi <- phi[order(as.integer(str_extract(names(phi), "\\d+$")))]
+
+  if (length(phi) == 0) return(NA)
+
+  roots <- polyroot(c(1, -phi))
+
+  tibble(
+    min_abs_root = min(Mod(roots)),
+    stable = min(Mod(roots)) > 1
+  )
+}
+
+extract_lm_diagnostics <- function(model_info, data) {
+  fit <- model_info$fit[[1]]
+
+  e <- resid(fit)
+
+  diagn_sign <- map_dfc(regressors, \(reg) {
+    if (str_detect(paste(names(coef(fit)), collapse = " "), reg)) {
+      tibble(
+        "sum_coef_{reg}" := sum(coef(fit)[grep(reg, names(coef(fit)), value = TRUE)]),
+        "joint_{reg}_p" := linearHypothesis(fit, grep(reg, names(coef(fit)), value = TRUE), vcov. = hac_vcov(fit), test = "Chisq")[[4]][[2]]
+      )
+    } else tibble("sum_coef_{reg}" := NA, "joint_{reg}_p" := NA)
+  })
+
+  cusum <- efp(fit, data = data, type = "Rec-CUSUM")
+
+  # Plots
+  ## Residuals
+  resid_plot <- tibble(
+    res = rstandard(fit),
+    date = data$date
+  ) %>%
+    ggplot(aes(x = date, y = res)) +
+    geom_line() +
+    geom_hline(yintercept = c(-3, 3), color = "red") +
+    geom_hline(yintercept = c(-2, 2), color = "red", linetype = "dashed") +
+    labs(title = glue("Standardized residuals for {model_info$model}"), x = NULL, y = NULL)
+
+  ## Residual autocorrelation
+  acf_pacf_plot <- get_acf_pacf_plot(e, title = glue("Residual ACF/PACF for {model_info$model}"))
+
+  ## Recursive CUSUM
+  cusum_plot <- tibble(
+    process = c(rep(NA, cusum$nreg-1), cusum$process),
+    boundary = c(rep(NA, cusum$nreg-1), strucchange::boundary(cusum, alpha = 0.05, alt.boundary = FALSE, functional = "max")),
+    date = data$date,
+  ) %>%
+    ggplot(aes(x = date, y = process)) +
+    geom_line() +
+    geom_line(aes(y = -boundary)) +
+    geom_line(aes(y = boundary)) +
+    geom_hline(aes(yintercept = 0)) +
+    labs(title = glue("Recursive CUSUM test for {model_info$model}"), x = NULL, y = NULL)
+
+  # Test values
+  diagn_main <- tibble(
+    # Residual autocorrelation
+    diagn_bg_4_p = bgtest(fit, order = 4)$p.value,
+    diagn_bg_8_p = bgtest(fit, order = 8)$p.value,
+    diagn_lb_4_p = Box.test(e, lag = 4, type = "Ljung-Box", fitdf = model_info$gdp_yoy)$p.value,
+    diagn_lb_8_p = Box.test(e, lag = 8, type = "Ljung-Box", fitdf = model_info$gdp_yoy)$p.value,
+    # Heteroskedasticity (Breusch-Pagan)
+    diagn_het_p = bptest(fit)$p.value,
+    # Normality
+    diagn_jb_p = jarque.bera.test(residuals(fit))$p.value,
+    # Stationarity (for AR part) (should be > 1)
+    diagn_ar_root = ar_root_check(fit)$min_abs_root,
+    # Parameter stability
+    diagn_cusum_p = sctest(cusum)$p.value,
+    # Block t-tests
+    !!!diagn_sign,
+    # Plots
+    resid_plot = list(resid_plot),
+    acf_pacf_plot = list(acf_pacf_plot),
+    cusum_plot = list(cusum_plot)
+  )
+
+  diagn_main
+}
+
+## VAR
+extract_var_diagnostics <- function(model_info, data) {
+  fit <- model_info$fit[[1]]
+
+  oth_vars <- names(fit$varresult)[-1]
+
+  # Refit with (Intercept) instead of const, so NeweyWest works
+  gdp_eq <- update(fit$varresult$gdp_yoy, . ~ . - const + 1, data = fit$varresult$gdp_yoy$model)
+
+  cusum <- stability(fit, type = "Rec-CUSUM")$stability$gdp_yoy
+
+  ## Recursive CUSUM
+  cusum_plot <- tibble(
+    process = c(rep(NA, cusum$nreg-1), cusum$process),
+    boundary = c(rep(NA, cusum$nreg-1), strucchange::boundary(cusum, alpha = 0.05, alt.boundary = FALSE, functional = "max")),
+    date = data$date,
+  ) %>%
+    ggplot(aes(x = date, y = process)) +
+    geom_line() +
+    geom_line(aes(y = -boundary)) +
+    geom_line(aes(y = boundary)) +
+    geom_hline(aes(yintercept = 0)) +
+    labs(title = glue("Recursive CUSUM test for {model_info$model}"), x = NULL, y = NULL)
+
+  diagn_sign <- map_dfc(model_info$regressors[[1]], \(reg) {
+    if (str_detect(paste(names(coef(gdp_eq)), collapse = " "), reg)) {
+      tibble(
+        "sum_coef_{reg}" := sum(coef(gdp_eq)[grep(reg, names(coef(gdp_eq)), value = TRUE)]),
+        "joint_{reg}_p" := linearHypothesis(gdp_eq, grep(reg, names(coef(gdp_eq)), value = TRUE), vcov. = hac_vcov(gdp_eq), test = "Chisq")[[4]][[2]]
+      )
+    } else tibble("sum_coef_{reg}" := NA, "joint_{reg}_p" := NA)
+  })
+
+  # diagn_granger <- c(
+  #   map_dbl(oth_vars, ~ causality(fit, cause = .)$Granger$p.value[[1]]),
+  #   causality(fit, cause = oth_vars)$Granger$p.value[[1]]
+  # ) %>%
+  #   setNames(c(paste0("gr_", oth_vars, "_p"), "gr_joint_p"))
+
+  diagn_main <- tibble(
+    # Residual correlation
+    diagn_bg_4_p = serial.test(fit, lags.pt = 4, type = "BG")$serial$p.value,
+    diagn_bg_8_p = serial.test(fit, lags.pt = 8, type = "BG")$serial$p.value,
+    # Heteroskedasticity (ARCH)
+    diagn_het_p = arch.test(fit, lags.multi = 4)$arch.mul$p.value,
+    # Normality
+    diagn_jb_p = normality.test(fit)$jb.mul$JB$p.value[[1]],
+    # Stationarity
+    diagn_var_eigen = max(roots(fit)),
+    # Recursive CUSUM,
+    diagn_cusum_p = sctest(cusum)$p.value,
+    cusum_plot = list(cusum_plot),
+    # # Granger causality
+    # !!!diagn_granger
+    # Effects and joint significance in GDP equation
+    !!!diagn_sign
+  )
+
+  diagn_main
+}
+
+## ARMA
+arma_root_check <- function(fit, prefix = "gdp_yoy_l") {
+  b <- coef(fit)
+  names_b <- names(b)
+
+  # Non-seasonal dependent lag coefficients: ar1, ar2, ...
+  ar_lag <- b[str_detect(names_b, glue("^{prefix}[0-9]+$"))]
+  ar_lag <- ar_lag[order(as.integer(str_extract(names(ar_lag), "\\d+$")))]
+
+  # Non-seasonal AR coefficients: ar1, ar2, ...
+  ar <- b[str_detect(names_b, "^ar[0-9]+$")]
+  ar <- ar[order(as.integer(str_extract(names(ar), "\\d+$")))]
+
+  # Non-seasonal MA coefficients: ma1, ma2, ...
+  ma <- b[str_detect(names_b, "^ma[0-9]+$")]
+  ma <- ma[order(as.integer(str_extract(names(ma), "\\d+$")))]
+
+  # Seasonal AR coefficients: sar1, sar2, ...
+  sar <- b[str_detect(names_b, "^sar[0-9]+$")]
+  sar <- sar[order(as.integer(str_extract(names(sar), "\\d+$")))]
+
+  # Seasonal MA coefficients: sma1, sma2, ...
+  sma <- b[str_detect(names_b, "^sma[0-9]+$")]
+  sma <- sma[order(as.integer(str_extract(names(sma), "\\d+$")))]
+
+  ord <- arimaorder(fit)
+  period <- ord[["Frequency"]]
+
+  make_seasonal_poly <- function(coefs, sign = -1, period = 4) {
+    if (length(coefs) == 0) return(NULL)
+
+    poly <- rep(0, length(coefs) * period + 1)
+    poly[1] <- 1
+
+    for (i in seq_along(coefs)) {
+      poly[1 + i * period] <- sign * coefs[i]
+    }
+
+    poly
+  }
+
+  ar_lag_poly <- if (length(ar_lag) > 0) c(1, -ar_lag) else NULL
+  ar_poly <- if (length(ar) > 0) c(1, -ar) else NULL
+  ma_poly <- if (length(ma) > 0) c(1,  ma) else NULL
+
+  sar_poly <- make_seasonal_poly(sar, sign = -1, period = period)
+  sma_poly <- make_seasonal_poly(sma, sign =  1, period = period)
+
+  ar_roots <- c(
+    if (!is.null(ar_lag_poly)) polyroot(ar_lag_poly) else numeric(0),
+    if (!is.null(ar_poly)) polyroot(ar_poly) else numeric(0),
+    if (!is.null(sar_poly)) polyroot(sar_poly) else numeric(0)
+  )
+
+  ma_roots <- c(
+    if (!is.null(ma_poly)) polyroot(ma_poly) else numeric(0),
+    if (!is.null(sma_poly)) polyroot(sma_poly) else numeric(0)
+  )
+
+  tibble(
+    ar_min_root = if (length(ar_roots) > 0) min(Mod(ar_roots)) else NA,
+    ma_min_root = if (length(ma_roots) > 0) min(Mod(ma_roots)) else NA,
+  )
+}
+
+wald_arima_block <- function(fit, pattern) {
+  b <- coef(fit)
+  V <- fit$var.coef
+
+  idx <- str_detect(names(b), pattern)
+
+  if (!any(idx)) {
+    return(p_value = NA)
+  }
+
+  b_block <- b[idx]
+  V_block <- V[idx, idx, drop = FALSE]
+
+  # robust to near-singular covariance matrices
+  stat <- tryCatch(
+    as.numeric(t(b_block) %*% solve(V_block, b_block)),
+    error = function(e) as.numeric(t(b_block) %*% MASS::ginv(V_block) %*% b_block)
+  )
+
+  df <- length(b_block)
+
+  tibble(
+    eff = sum(b_block),
+    p_value = pchisq(stat, df = df, lower.tail = FALSE)
+  )
+}
+
+extract_arma_diagnostics <- \(model_info, data) {
+  fit <- model_info$fit[[1]]
+  model_name <- model_info$model
+
+  e <- as.numeric(residuals(fit))
+  e <- e[is.finite(e)]
+  sigma_hat <- sqrt(fit$sigma2)
+
+  # ARIMA order
+  ord <- arimaorder(fit)
+
+  arma_df <- sum(ord[c("p", "q", "P", "Q")], na.rm = TRUE)
+
+  safe_lb <- function(e, lag, fitdf = 0) {
+    if (lag <= fitdf) return(NA)
+    Box.test(e, lag = lag, type = "Ljung-Box", fitdf = fitdf)$p.value
+  }
+
+  # ARCH test fallback: Ljung-Box on squared residuals
+  arch_lb <- function(e, lag = 4) {
+    Box.test(e^2, lag = lag, type = "Ljung-Box")$p.value
+  }
+
+  # Residual plots
+  resid_plot <- tibble(
+    res = as.numeric(e) / sigma_hat,
+    date = tail(data$date, length(e))
+  ) %>%
+    ggplot(aes(x = date, y = res)) +
+    geom_line() +
+    geom_hline(yintercept = c(-3, 3), color = "red") +
+    geom_hline(yintercept = c(-2, 2), color = "red", linetype = "dashed") +
+    labs(
+      title = glue("Standardized residuals for {model_name}"),
+      x = NULL,
+      y = NULL
+    )
+
+  acf_pacf_plot <- get_acf_pacf_plot(
+    e,
+    title = glue("Residual ACF/PACF for {model_name}")
+  )
+
+  root_info <- arma_root_check(fit)
+
+  diagn_sign <- map_dfc(c(regressors, "^ar"), \(reg) {
+     if (str_detect(paste(names(coef(fit)), collapse = " "), reg)) {
+      test <- wald_arima_block(fit, reg)
+      tibble(
+        "sum_coef_{reg}" := test$eff,
+        "joint_{reg}_p" := test$p_value
+      )
+     } else tibble("sum_coef_{reg}" := NA, "joint_{reg}_p" := NA)
+  }) %>%
+    mutate(
+      sum_coef_gdp_yoy = coalesce(sum_coef_gdp_yoy, `sum_coef_^ar`),
+      joint_gdp_yoy_p = coalesce(joint_gdp_yoy_p, `joint_^ar_p`),
+      .keep = "unused"
+    )
+
+  tibble(
+    diagn_lb_4_p = safe_lb(e, lag = 4, fitdf = arma_df),
+    diagn_lb_8_p = safe_lb(e, lag = 8, fitdf = arma_df),
+
+    diagn_het_p = arch_lb(e, lag = 4),
+
+    diagn_jb_p = jarque.bera.test(e)$p.value,
+
+    diagn_ar_root = root_info$ar_min_root,
+    diagn_ma_root = root_info$ma_min_root,
+
+    !!!diagn_sign,
+
+    resid_plot = list(resid_plot),
+    acf_pacf_plot = list(acf_pacf_plot)
+  )
+}
+
+model_diagnostics <- model_shortlist %>%
+  rowwise() %>%
+  mutate(switch(
+    type,
+    "ARDL" = extract_lm_diagnostics(cur_data(), selection_dataset),
+    "VAR" = extract_var_diagnostics(cur_data(), selection_dataset),
+    "ARDL_ARMA" = extract_arma_diagnostics(cur_data(), selection_dataset),
+    "ARMAX" = extract_arma_diagnostics(cur_data(), selection_dataset)
+  )) %>%
+  ungroup()
+
+model_diagnostics %>%
+  select(-c(type, regressors, controls, fit, fit_aic, fit_bic, selection, ends_with("plot"), starts_with("sum_coef_"), starts_with("joint_"), contains("gr"))) %>%
+  mutate(diagn_ma_root = sprintf("%.8f", diagn_ma_root)) %>%
+  kable(
+    digits = 3,
+    caption = "Model diagnostics"
+  )
+
+model_diagnostics %>%
+  select(-c(type, regressors, controls, fit, fit_aic, fit_bic, selection, ends_with("plot"), starts_with("diagn_"))) %>%
+  kable(
+    digits = 3,
+    caption = "Model economic hypotheses"
+  )
+```
+
+```{r diagnostics_plots, fig.width = 25, fig.height = 25, out.width="100%"}
+diagn_resid_plot <- grid.arrange(grobs = discard(model_diagnostics$resid_plot, is.null))
+ggsave("output/figures/diagn_std_residuals.png", diagn_resid_plot, width = 25, height = 20, dpi = 300)
+
+diagn_acf_pacf_plot <- grid.arrange(grobs = discard(model_diagnostics$acf_pacf_plot, is.null))
+ggsave("output/figures/diagn_acf_pacf.png", diagn_acf_pacf_plot, width = 25, height = 20, dpi = 300)
+
+diagn_cusum_plot <- grid.arrange(grobs = discard(model_diagnostics$cusum_plot, is.null))
+ggsave("output/figures/diagn_cusum.png", diagn_cusum_plot, width = 25, height = 20, dpi = 300)
+```
+
+### Comment
+
+#### Residual diagnostics
+
+The plain ARDL models improve on the basic benchmarks (heteroskedasticity, normality,
+stability) but still show residual autocorrelation (base effects) and some instability,
+so they are not fully satisfactory as final models.
+
+The ARDL_ARMA and ARMAX models perform better on residual autocorrelation tests,
+although they have almost unit MA roots. This means that they should be interpreted
+mainly as forecasting models rather than structural economic models.
+
+#### Economic hypothesis
+
+`sum_coef` are lagged variable coefficient sums; interpreted mostly for their sign.
+`joint_p` is the p-value for the null hypothesis that all lags are 0.
+
+The block tests for variable lags suggest that GDP persistence (positive), inflation
+(negative) and unemployment (positive) contain useful predictive information for
+GDP growth.
+Remember that the effects are not causal; the positive unemployment effect likely
+reflects cyclical mean reversion, where higher unemployment occurs during recessions
+followed by recoveries.
+The evidence for the relationship with the (change in) the cash rate is mixed both
+in terms of sign and significance, depending on the specification.
+
+
+# Recursive Forecasts
+
+## Forecasting
+
+```{r recursive_forecasts}
+# Run forecasts
+generate_recursive_forecast <- function(spec, data, eval_start, eval_end) {
+  eval_quarters <- data %>%
+    filter(
+      quarter >= eval_start,
+      quarter <= eval_end
+    ) %>%
+    pull(quarter)
+
+  map_dfr(
+    eval_quarters,
+    function(target_quarter) {
+      # browser()
+      train_data <- data %>% filter(quarter < target_quarter)
+      target_row <- data %>% filter(quarter == target_quarter)
+
+      if (nrow(train_data) == 0 || nrow(target_row) != 1) {
+        return(tibble())
+      }
+
+      model_info <- switch(spec$type,
+        "ARDL" = fit_lm_model(spec, train_data),
+        "VAR" = fit_var_model(spec, train_data),
+        "ARDL_ARMA" = fit_arma_model(spec, train_data),
+        "ARMAX" = fit_arma_model(spec, train_data)
+      )
+
+      forecast_value <- if (spec$type == "ARDL") {
+        predict(model_info$fit[[1]], newdata = target_row)
+      } else if (spec$type == "VAR") {
+        predict(model_info$fit[[1]], n.ahead = 1)$fcst$gdp_yoy[, "fcst"]
+      } else if (spec$type %in% c("ARDL_ARMA", "ARMAX")) {
+        all_regressors <- c(spec$regressors[[1]], spec$controls[[1]])
+        as.double(forecast(model_info$fit[[1]], xreg = as.matrix(target_row[, all_regressors]), h = 1)$mean)
+      }
+
+      actual_value <- target_row$gdp_yoy[[1]]
+      error_value <- actual_value - forecast_value
+
+      tibble(
+        date = target_row$date[[1]],
+        quarter = target_quarter,
+        fit = list(model_info$fit[[1]]),
+        forecast = forecast_value,
+        actual = actual_value,
+        error = error_value,
+      )
+    }
+  )
+}
+
+if (generate_forecasts | !file.exists(path_forecasts)) {
+  forecast_results <- model_shortlist %>%
+    rowwise() %>%
+    mutate(frcst = list(generate_recursive_forecast(cur_data(), model_dataset, evaluation_start, evaluation_end)))
+
+  saveRDS(forecast_results, path_forecasts)
+} else {
+  forecast_results <- readRDS(path_forecasts)
+}
+```
+
+## Forecast evaluation
+
+```{r forecast_eval}
+# Evaluation metrics
+get_act_vs_frcst_plot <- function(forecast_results, title = "Recursive 1-ahead forecasts") {
+  forecast_results %>%
+  ggplot(aes(x = date)) +
+    geom_col(aes(y = error, fill = "Error")) +
+    geom_line(aes(y = actual, color = "Actual")) +
+    geom_line(aes(y = forecast, color = "Forecast")) +
+    scale_color_manual(values = c("Actual" = "black", "Forecast" = "red", "Error" = "grey")) +
+    scale_fill_manual(values = c("Error" = "grey")) +
+    labs(
+      title = title,
+      x = NULL,
+      y = "GDP growth (YoY, %)",
+      color = NULL, fill = NULL
+    ) +
+    theme(panel.grid.minor = element_blank())
+}
+
+get_cumse_plot <- function(forecast_results, title = "Cumulative squared forecast errors") {
+  forecast_results %>%
+    mutate(cumulative_squared_error = cumsum(error^2)) %>%
+    ggplot(aes(x = date, y = cumulative_squared_error)) +
+    geom_line() +
+    labs(
+      title = title,
+      x = NULL,
+      y = "Cumulative squared error"
+    ) +
+    theme(panel.grid.minor = element_blank())
+}
+
+
+get_model_forecast_eval <- \(model_info, spec_ar2, spec_var2) {
+  fit_data <- model_info$frcst[[1]]
+
+  fit_err <- lm(error ~ 1, data = fit_data)
+
+  if (model_info$model != "AR2") {
+    dm_ar2_p <- dm.test(fit_data$error, spec_ar2$frcst[[1]]$error, alternative = "less")$p.value
+
+    diff_loss_ar2 <- fit_data$error^2 - spec_ar2$frcst[[1]]$error^2
+    fit_loss_ar2 <- lm(diff_loss_ar2 ~ 1)
+
+    # hac_loss_ar2_p <- coeftest(fit_loss_ar2, vcov. = hac_vcov(fit_loss_ar2, lag = 4))[1, "Pr(>|t|)"]
+    hac_loss_ar2_p <- hypotheses(fit_loss_ar2, "`(Intercept)` >= 0", vcov = hac_vcov(fit_loss_ar2, lag = 4))$p.value
+  } else {
+    dm_ar2_p <- NA
+    hac_loss_ar2_p <- NA
+  }
+
+
+  if (model_info$model != "VAR2") {
+    dm_var2_p <- dm.test(fit_data$error, spec_var2$frcst[[1]]$error, alternative = "less")$p.value
+
+    diff_loss_var2 <- fit_data$error^2 - spec_var2$frcst[[1]]$error^2
+    fit_loss_var2 <- lm(diff_loss_var2 ~ 1)
+
+    # hac_loss_var2_p <- coeftest(fit_loss_var2, vcov. = hac_vcov(fit_loss_var2, lag = 4))[1, "Pr(>|t|)"]
+    hac_loss_var2_p <- hypotheses(fit_loss_var2, "`(Intercept)` >= 0", vcov = hac_vcov(fit_loss_var2, lag = 4))$p.value
+  } else {
+    dm_var2_p <- NA
+    hac_loss_var2_p <- NA
+  }
+
+  tibble(
+    # Bias test: H0 E(error) = 0
+    bias_p = coeftest(fit_err, vcov. = hac_vcov(fit_err, lag = 4))[1, "Pr(>|t|)"],
+    # Weak efficiency
+    error_bg4_p = bgtest(fit_err, order = 4)$p.value,
+    error_lb4_p = Box.test(fit_data$error, lag = 4, type = "Ljung-Box")$p.value,
+    error_lb8_p = Box.test(fit_data$error, lag = 8, type = "Ljung-Box")$p.value,
+    # Diebold-Mariano
+    dm_ar2_p = dm_ar2_p,
+    dm_var2_p = dm_var2_p,
+    # HAC loss tests
+    hac_loss_ar2_p,
+    hac_loss_var2_p
+  )
+}
+
+## Test full sample and also excluding covid (2020Q1-2022Q4)
+forecast_metrics <- forecast_results %>%
+  rowwise() %>%
+  mutate(
+    summarise(
+      frcst,
+      mfe = mean(error, na.rm = TRUE),
+      msfe = mean(error^2, na.rm = TRUE),
+      rmsfe = sqrt(msfe),
+      mafe = mean(abs(error), na.rm = TRUE),
+      act_frcst_plot = list(get_act_vs_frcst_plot(frcst, title = glue("Rec. 1-ahead frcst for {model}"))),
+      cumse_plot = list(get_cumse_plot(frcst, title = glue("Cum. sq. frcst errors for {model}")))
+    )
+  ) %>%
+  mutate(
+    summarise(
+      filter(frcst, date < "2020-01-01" | date > "2022-10-01"),
+      msfe_exc = mean(error^2, na.rm = TRUE),
+      rmsfe_exc = sqrt(msfe_exc),
+      mafe_exc = mean(abs(error), na.rm = TRUE),
+      cumse_exc_plot = list(get_cumse_plot(cur_data(), title = glue("Cum. sq. frcst errors for {model} (excl. COVID)")))
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(across(c(msfe, msfe_exc), ~ . / .[model == "AR2"], .names = "{.col}_v_AR2")) %>%
+  mutate(across(c(msfe, msfe_exc), ~ . / .[model == "VAR2"], .names = "{.col}_v_VAR2")) %>%
+  rowwise() %>%
+  mutate(get_model_forecast_eval(
+    cur_data(),
+    spec_ar2 = .[.$model == "AR2",],
+    spec_var2 = .[.$model == "VAR2",]
+  ))
+
+forecast_metrics %>%
+  select(-c(type, regressors, controls, fit, fit_bic, fit_aic, selection, frcst, ends_with("plot"))) %>%
+  kable(
+    digits = 3,
+    caption = "Forecast performance"
+  )
+```
+
+```{r forecast_eval_plots, fig.width = 30, fig.height = 20, out.width="100%"}
+eval_act_frcst_plot_comb <- forecast_metrics %>%
+  mutate(class = if_else(family == "benchmark", glue("Benchmark ({model})"), type)) %>%
+  select(model, type, class, frcst) %>%
+  unnest(frcst) %>%
+  ggplot(aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual", linewidth = "Actual", linetype = "Actual")) +
+    geom_line(aes(y = forecast, group = model, color = class, linewidth = class, linetype = class)) +
+    scale_color_manual(
+      values = c(
+        "Actual" = "#111111",
+        "Benchmark (AR2)" = "#4c78a8",
+        "Benchmark (VAR2)" = "#f58518",
+        "Benchmark (VAR2d)" = "#f58518",
+        "ARDL" = "#72b7b2",
+        "ARDL_ARMA" = "#e45756",
+        "ARMAX" = "violet"
+      )
+    ) +
+    scale_linewidth_manual(
+      values = c(
+        "Actual" = 1.5,
+        "Benchmark (AR2)" = 1.5,
+        "Benchmark (VAR2)" = 1.5,
+        "Benchmark (VAR2d)" = 1.5,
+        "ARDL" = 0.7,
+        "ARDL_ARMA" = 0.7,
+        "ARMAX" = 0.7
+      )
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "Actual" = "solid",
+        "Benchmark (AR2)" = "solid",
+        "Benchmark (VAR2)" = "solid",
+        "Benchmark (VAR2d)" = "dashed",
+        "ARDL" = "solid",
+        "ARDL_ARMA" = "solid",
+        "ARMAX" = "solid"
+      )
+    ) +
+    labs(
+      title = "Recursive 1-ahead forecasts",
+      x = NULL,
+      y = "GDP growth (YoY, %)",
+      color = NULL, linewidth = NULL, linetype = NULL
+    ) +
+    theme(panel.grid.minor = element_blank()) +
+    facet_wrap(~ type)
+
+eval_cumse_plot_comb <- forecast_metrics %>%
+  mutate(class = if_else(family == "benchmark", glue("Benchmark ({model})"), type)) %>%
+  select(model, type, class, frcst) %>%
+  unnest(frcst) %>%
+  mutate(cumse = cumsum(error^2), .by = model) %>%
+  ggplot(aes(x = date)) +
+    geom_line(aes(y = cumse, group = model, color = class, linewidth = class, linetype = class)) +
+    scale_color_manual(
+      values = c(
+        "Benchmark (AR2)" = "#4c78a8",
+        "Benchmark (VAR2)" = "#f58518",
+        "Benchmark (VAR2d)" = "#f58518",
+        "ARDL" = "#72b7b2",
+        "ARDL_ARMA" = "#e45756",
+        "ARMAX" = "violet"
+      )
+    ) +
+    scale_linewidth_manual(
+      values = c(
+        "Benchmark (AR2)" = 1.5,
+        "Benchmark (VAR2)" = 1.5,
+        "Benchmark (VAR2d)" = 1.5,
+        "ARDL" = 0.7,
+        "ARDL_ARMA" = 0.7,
+        "ARMAX" = 0.7
+      )
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "Benchmark (AR2)" = "solid",
+        "Benchmark (VAR2)" = "solid",
+        "Benchmark (VAR2d)" = "dashed",
+        "ARDL" = "solid",
+        "ARDL_ARMA" = "solid",
+        "ARMAX" = "solid"
+      )
+    ) +
+    labs(
+      title = "Cumulative squared forecast errors",
+      x = NULL,
+      y = "Cumulative squared error",
+      color = NULL, linewidth = NULL, linetype = NULL
+    ) +
+    theme(panel.grid.minor = element_blank())
+
+# eval_cumse_plot_comb + facet_wrap(~ type)
+
+eval_cumse_exc_plot_comb <- forecast_metrics %>%
+  mutate(class = if_else(family == "benchmark", glue("Benchmark ({model})"), type)) %>%
+  select(model, type, class, frcst) %>%
+  unnest(frcst) %>%
+  filter(date < "2020-01-01" | date > "2022-10-01") %>%
+  mutate(cumse = cumsum(error^2), .by = model) %>%
+  ggplot(aes(x = date)) +
+    geom_line(aes(y = cumse, group = model, color = class, linewidth = class, linetype = class)) +
+    scale_color_manual(
+      values = c(
+        "Benchmark (AR2)" = "#4c78a8",
+        "Benchmark (VAR2)" = "#f58518",
+        "Benchmark (VAR2d)" = "#f58518",
+        "ARDL" = "#72b7b2",
+        "ARDL_ARMA" = "#e45756",
+        "ARMAX" = "violet"
+      )
+    ) +
+    scale_linewidth_manual(
+      values = c(
+        "Benchmark (AR2)" = 1.5,
+        "Benchmark (VAR2)" = 1.5,
+        "Benchmark (VAR2d)" = 1.5,
+        "ARDL" = 0.7,
+        "ARDL_ARMA" = 0.7,
+        "ARMAX" = 0.7
+      )
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "Benchmark (AR2)" = "solid",
+        "Benchmark (VAR2)" = "solid",
+        "Benchmark (VAR2d)" = "dashed",
+        "ARDL" = "solid",
+        "ARDL_ARMA" = "solid",
+        "ARMAX" = "solid"
+      )
+    ) +
+    labs(
+      title = "Cumulative squared forecast errors (excluding COVID)",
+      x = NULL,
+      y = "Cumulative squared error",
+      color = NULL, linewidth = NULL, linetype = NULL
+    ) +
+    theme(panel.grid.minor = element_blank())
+
+# eval_cumse_exc_plot_comb + facet_wrap(~ type)
+
+eval_act_frcst_plot <- grid.arrange(grobs = discard(forecast_metrics$act_frcst_plot, is.null))
+ggsave("output/figures/eval_act_frcst.png", eval_act_frcst_plot, width = 30, height = 15, dpi = 300)
+
+eval_cumse_plot <- grid.arrange(grobs = discard(forecast_metrics$cumse_plot, is.null))
+ggsave("output/figures/eval_cumse.png", eval_cumse_plot, width = 30, height = 15, dpi = 300)
+
+eval_cumse_exc_plot <- grid.arrange(grobs = discard(forecast_metrics$cumse_exc_plot, is.null))
+ggsave("output/figures/eval_cumse_exc.png", eval_cumse_exc_plot, width = 30, height = 15, dpi = 300)
+```
+
+```{r forecast_eval_plots_comb, fig.width = 16, fig.height = 12}
+eval_act_frcst_plot_comb
+# ggsave("output/figures/eval_act_frcst_comb.png", eval_act_frcst_plot_comb, width = 16, height = 12, dpi = 300)
+{eval_act_frcst_plot_comb + labs(title = NULL)} %>%
+ggsave("output/figures/eval_act_frcst_comb.png", ., width = 8.5, height = 4.6, dpi = 300)
+
+eval_cumse_plot_comb
+# ggsave("output/figures/eval_cumse_comb.png", eval_cumse_plot_comb, width = 16, height = 12, dpi = 300)
+{eval_cumse_plot_comb + labs(title = NULL)} %>%
+ggsave("output/figures/eval_cumse_comb.png", ., width = 6, height = 3.5, dpi = 300)
+
+eval_cumse_exc_plot_comb
+# ggsave("output/figures/eval_cumse_exc_comb.png", eval_cumse_exc_plot_comb, width = 16, height = 12, dpi = 300)
+{eval_cumse_exc_plot_comb + labs(title = NULL)} %>%
+ggsave("output/figures/eval_cumse_exc_comb.png", ., width = 6, height = 3.5, dpi = 300)
+```
+
+## Comment
+
+The recursive 1-step-ahead forecasts and cumulative squared errors show that the
+main difficulty is COVID: most models miss the 2020Q2 contraction and then under-
+or over-adjust during the 2021 rebound.
+Before COVID, forecast errors are relatively small across models. During COVID,
+the benchmark AR(2), VAR(2), and plain ARDL models accumulate large errors, while
+errors for the ARDL-ARMA and ARMAX specifications rise more slowly, as they better
+track the rebound and normalization. This suggests that modelling residual dynamics
+is important for this forecasting exercise.
+We also perform a "normal times" comparison, excluding the 2020Q1-2022Q4 COVID period,
+which also supports ARDL-ARMA dominance, so the forecast gains are not only driven
+by extreme pandemic observations.
+
+The MSFE and RMSFE rankings favour the ARDL-ARMA and ARMAX models over the AR(2)
+and VAR(2) benchmarks. The best full-sample performer is ARDL_ARMA5010, improving
+on the AR(2) by 44.3% in MSFE terms. A more economically complete alternative is
+ARDL_ARMA5250 because it includes GDP growth, inflation, the change in the cash
+rate, and unemployment without significantly sacrificing forecasting performance.
+
+The best ARDL model is ARDL5201, a simple single-lag model including inflation,
+only marginally improving on an AR2 model. And for the ARMAX models, the best balance
+between full-sample and "normal-times" forecasting is given by ARMAX1450.
+
+### Forecast tests
+
+The preferred ARDL-ARMA and ARMAX models generally pass the forecast bias and forecast-error
+autocorrelation tests. This means their forecast errors are not clearly different
+from zero on average and do not show strong remaining serial correlation. By contrast,
+some benchmark and plain ARDL models show weaker forecast-error diagnostics.
+
+Although MSFE reductions relative to the AR2 are large, the Diebold-Mariano and
+HAC loss-difference tests are only significant at the 10% level for the best models.
+Therefore, the statistical evidence for forecasting improvements is marginal. This
+is not surprising because the evaluation sample only has 40 quarters, and a large
+share of the loss difference comes from a few extreme COVID observations.
+
+# Finalists
+
+```{r finalists, fig.width = 16, fig.height = 12}
+# Finalist evaluation
+# Show everything
+
+finalists <- c("AR2", "VAR2", "ARDL_ARMA5010", "ARDL_ARMA5250", "ARDL5201", "ARMAX1450")
+
+forecast_finalists <- model_diagnostics %>%
+  filter(model %in% finalists) %>%
+  left_join(select(forecast_metrics, -any_of(names(model_diagnostics)), model), by = "model")
+
+forecast_finalists %>%
+  select(-c(type, regressors, controls, fit, frcst, ends_with("plot"))) %>%
+  kable(
+    digits = 3,
+    caption = "Finalist performance"
+  )
+
+fin_act_frcst_plot_comb <- forecast_finalists %>%
+  select(model, type, frcst) %>%
+  unnest(frcst) %>%
+  ggplot(aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual", linewidth = "Actual", linetype = "Actual")) +
+    geom_line(aes(y = forecast, color = model, linewidth = model, linetype = model)) +
+    scale_color_manual(
+      values = c(
+        "Actual" = "#111111",
+        "AR2" = "#4c78a8",
+        "VAR2" = "#f58518",
+        "ARDL5201" = "#72b7b2",
+        "ARDL_ARMA5010" = "#e45756",
+        "ARDL_ARMA5250" = "#e45756",
+        "ARMAX1450" = "violet"
+      )
+    ) +
+    scale_linewidth_manual(
+      values = c(
+        "Actual" = 1.5,
+        "AR2" = 1.5,
+        "VAR2" = 1.5,
+        "ARDL5201" = 1,
+        "ARDL_ARMA5010" = 1,
+        "ARDL_ARMA5250" = 1,
+        "ARMAX1450" = 1
+      )
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "Actual" = "solid",
+        "AR2" = "solid",
+        "VAR2" = "solid",
+        "ARDL5201" = "solid",
+        "ARDL_ARMA5010" = "solid",
+        "ARDL_ARMA5250" = "dashed",
+        "ARMAX1450" = "solid"
+      )
+    ) +
+    labs(
+      title = "Recursive 1-ahead forecasts",
+      x = NULL,
+      y = "GDP growth (YoY, %)",
+      color = NULL, linewidth = NULL, linetype = NULL
+    ) +
+    theme(panel.grid.minor = element_blank())
+
+fin_cumse_plot_comb <- forecast_finalists %>%
+  select(model, type, frcst) %>%
+  unnest(frcst) %>%
+  mutate(cumse = cumsum(error^2), .by = model) %>%
+  ggplot(aes(x = date)) +
+    geom_line(aes(y = cumse, color = model, linewidth = model, linetype = model)) +
+    scale_color_manual(
+      values = c(
+        "AR2" = "#4c78a8",
+        "VAR2" = "#f58518",
+        "ARDL5201" = "#72b7b2",
+        "ARDL_ARMA5010" = "#e45756",
+        "ARDL_ARMA5250" = "#e45756",
+        "ARMAX1450" = "violet"
+      )
+    ) +
+    scale_linewidth_manual(
+      values = c(
+        "AR2" = 1.5,
+        "VAR2" = 1.5,
+        "ARDL5201" = 1,
+        "ARDL_ARMA5010" = 1,
+        "ARDL_ARMA5250" = 1,
+        "ARMAX1450" = 1
+      )
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "AR2" = "solid",
+        "VAR2" = "solid",
+        "ARDL5201" = "solid",
+        "ARDL_ARMA5010" = "solid",
+        "ARDL_ARMA5250" = "dashed",
+        "ARMAX1450" = "solid"
+      )
+    ) +
+    labs(
+      title = "Cumulative squared forecast errors",
+      x = NULL,
+      y = "Cumulative squared error",
+      color = NULL, linewidth = NULL, linetype = NULL
+    ) +
+    theme(panel.grid.minor = element_blank())
+
+fin_cumse_exc_plot_comb <- forecast_finalists %>%
+  select(model, type, frcst) %>%
+  unnest(frcst) %>%
+  filter(date < "2020-01-01" | date > "2022-10-01") %>%
+  mutate(cumse = cumsum(error^2), .by = model) %>%
+  ggplot(aes(x = date)) +
+    geom_line(aes(y = cumse, color = model, linewidth = model, linetype = model)) +
+    scale_color_manual(
+      values = c(
+        "AR2" = "#4c78a8",
+        "VAR2" = "#f58518",
+        "ARDL5201" = "#72b7b2",
+        "ARDL_ARMA5010" = "#e45756",
+        "ARDL_ARMA5250" = "#e45756",
+        "ARMAX1450" = "violet"
+      )
+    ) +
+    scale_linewidth_manual(
+      values = c(
+        "AR2" = 1.5,
+        "VAR2" = 1.5,
+        "ARDL5201" = 1,
+        "ARDL_ARMA5010" = 1,
+        "ARDL_ARMA5250" = 1,
+        "ARMAX1450" = 1
+      )
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "AR2" = "solid",
+        "VAR2" = "solid",
+        "ARDL5201" = "solid",
+        "ARDL_ARMA5010" = "solid",
+        "ARDL_ARMA5250" = "dashed",
+        "ARMAX1450" = "solid"
+      )
+    ) +
+    labs(
+      title = "Cumulative squared forecast errors (excluding COVID)",
+      x = NULL,
+      y = "Cumulative squared error",
+      color = NULL, linewidth = NULL, linetype = NULL
+    ) +
+    theme(panel.grid.minor = element_blank())
+```
+
+```{r finalist_plot_comv, fig.width = 16, fig.height = 12}
+fin_act_frcst_plot_comb
+fin_cumse_plot_comb
+fin_cumse_exc_plot_comb
+```
