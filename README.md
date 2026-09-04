@@ -86,11 +86,8 @@ The analysis is implemented in **R**, primarily using `forecast`, `vars`, `struc
 ├── australia_forecasting_slides.pdf  # Final presentation
 ├── presentation/
 │   └── australia_forecasting_slides.tex
-├── data/
-│   └── data_raw.xlsx                  # Source macroeconomic data
-├── renv.lock                          # Recorded R package environment
-├── renv/
-└── .Rprofile
+└── data/
+    └── data_raw.xlsx                  # Source macroeconomic data
 ```
 
 ## Reproducibility
